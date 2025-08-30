@@ -1,6 +1,10 @@
 #if defined(_MSC_VER)
 #pragma warning(disable : 4505) // unreferenced function with internal linkage has been removed
 #pragma warning(disable : 4324) // structure was padded due to alignment specifier
+
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS // Disable "This function or variable may be unsafe" warnings
+#endif
 #endif
 
 /**
@@ -117,7 +121,6 @@
 
 #if defined(_WIN32)
 #define NOMINMAX                // Disable `max` macros conflicting with STL symbols
-#define _CRT_SECURE_NO_WARNINGS // Disable "This function or variable may be unsafe" warnings
 #include <windows.h>            // `GlobalMemoryStatusEx`
 #include <io.h>                 // `_isatty`, `_fileno`
 #endif
@@ -159,8 +162,9 @@
 
 #define fu_unused_(x) ((void)(x))
 
-#if FU_DETECT_CPP_20_
+#if FU_DETECT_CPP_20_ && defined(__GNUC__) || defined(__clang__)
 #define fu_unlikely_(x) __builtin_expect(!!(x), 0)
+//#define fu_unlikely_(x) [[unlikely]] (x)  -- does not work because the [[]] attribute MUST land *outside* the `if` condition expression, and these macros are used *within* that expression, resulting in compiler errors.
 #else
 #define fu_unlikely_(x) (x)
 #endif
