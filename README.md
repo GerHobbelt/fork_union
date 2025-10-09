@@ -87,6 +87,56 @@ pool.for_n_dynamic(100, |prong| {
 });
 ```
 
+#### Parallel Iterator API
+
+For Rayon-style ergonomics, use the parallel iterator API with the `prelude`:
+
+```rust
+use fork_union as fu;
+use fork_union::prelude::*;
+
+let mut pool = fu::spawn(4);
+let mut data: Vec<usize> = (0..1000).collect();
+
+// Static scheduling (default)
+(&data[..])
+    .into_par_iter()
+    .with_pool(&mut pool)
+    .for_each(|value| {
+        // Process each element
+        println!("Value: {}", value);
+    });
+
+// Dynamic work-stealing
+(&mut data[..])
+    .into_par_iter()
+    .with_schedule(&mut pool, DynamicScheduler)
+    .for_each(|value| {
+        *value *= 2;
+    });
+
+// Advanced: map, filter, zip
+(&data[..])
+    .into_par_iter()
+    .filter(|&x| x % 2 == 0)
+    .map(|x| x * x)
+    .with_pool(&mut pool)
+    .for_each(|value| {
+        // Process filtered & mapped values
+        println!("Squared even: {}", value);
+    });
+
+// Parallel reduction with thread-local scratch space
+let mut scratch = vec![0usize; pool.threads()];
+(&data[..])
+    .into_par_iter()
+    .with_pool(&mut pool)
+    .fold_with_scratch(&mut scratch, |acc, value, _prong| {
+        *acc += *value;
+    });
+let total: usize = scratch.iter().sum();
+```
+
 A more realistic example with named threads and error handling may look like this:
 
 ```rust

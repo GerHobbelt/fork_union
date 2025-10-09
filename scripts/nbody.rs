@@ -7,14 +7,15 @@
 //! - `NBODY_BACKEND` - backend to use for the simulation (default: `fork_union_static`).
 //! - `NBODY_THREADS` - number of threads to use for the simulation (default: number of hardware threads).
 //!
-//! The backends include: `fork_union_static`, `fork_union_dynamic`, `rayon_static`, `rayon_dynamic`,
-//! and `tokio`. To compile and run:
+//! The backends include: `fork_union_static`, `fork_union_dynamic`, `fork_union_iter_static`,
+//! `fork_union_iter_dynamic`, `rayon_static`, `rayon_dynamic`, and `tokio`. To compile and run:
 //!
 //! ```sh
 //! cargo run --example nbody --release
 //! ```
 //!
-//! The default profiling scheme is to 1M iterations for 128 particles on each backend:
+//! The default profiling scheme is to 1M iterations for 128 particles on each backend.
+//! On Linux, use `$(nproc)` for thread count; on macOS, use `$(sysctl -n hw.logicalcpu)`:
 //!
 //! ```sh
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
@@ -25,6 +26,10 @@
 //!     NBODY_BACKEND=fork_union_static cargo run --example nbody --release
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
 //!     NBODY_BACKEND=fork_union_dynamic cargo run --example nbody --release
+//! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
+//!     NBODY_BACKEND=fork_union_iter_static cargo run --example nbody --release
+//! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
+//!     NBODY_BACKEND=fork_union_iter_dynamic cargo run --example nbody --release
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
 //!     NBODY_BACKEND=tokio cargo run --example nbody --release
 //! ```
@@ -162,6 +167,77 @@ fn iteration_fu_dynamic(pool: &mut fu::ThreadPool, bodies: &mut [Body], forces: 
         fu::for_each_prong_mut_dynamic(pool, bodies, move |body, prong| {
             apply_force(body, &forces_ref[prong.task_index]);
         });
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Fork-Union Iterator API kernels
+// ────────────────────────────────────────────────────────────────────────────
+fn iteration_fu_iter_static(
+    pool: &mut fu::ThreadPool,
+    bodies: &mut [Body],
+    forces: &mut [Vector3],
+) {
+    use fu::ParallelIteratorExt;
+    let n = bodies.len();
+
+    // First pass: calculate forces
+    {
+        let bodies_ref = &*bodies;
+        fu::IntoParallelIterator::into_par_iter(&mut forces[..])
+            .with_pool(pool)
+            .for_each_with_prong(|force, prong| {
+                let bi = &bodies_ref[prong.task_index];
+                let mut acc = Vector3::default();
+                for bj in bodies_ref.iter().take(n) {
+                    acc += gravitational_force(bi, bj);
+                }
+                *force = acc;
+            });
+    }
+
+    // Second pass: apply forces
+    {
+        let forces_ref = &*forces;
+        fu::IntoParallelIterator::into_par_iter(&mut bodies[..])
+            .with_pool(pool)
+            .for_each_with_prong(|body, prong| {
+                apply_force(body, &forces_ref[prong.task_index]);
+            });
+    }
+}
+
+fn iteration_fu_iter_dynamic(
+    pool: &mut fu::ThreadPool,
+    bodies: &mut [Body],
+    forces: &mut [Vector3],
+) {
+    use fu::ParallelIteratorExt;
+    let n = bodies.len();
+
+    // First pass: calculate forces
+    {
+        let bodies_ref = &*bodies;
+        fu::IntoParallelIterator::into_par_iter(&mut forces[..])
+            .with_schedule(pool, fu::DynamicScheduler)
+            .for_each_with_prong(|force, prong| {
+                let bi = &bodies_ref[prong.task_index];
+                let mut acc = Vector3::default();
+                for bj in bodies_ref.iter().take(n) {
+                    acc += gravitational_force(bi, bj);
+                }
+                *force = acc;
+            });
+    }
+
+    // Second pass: apply forces
+    {
+        let forces_ref = &*forces;
+        fu::IntoParallelIterator::into_par_iter(&mut bodies[..])
+            .with_schedule(pool, fu::DynamicScheduler)
+            .for_each_with_prong(|body, prong| {
+                apply_force(body, &forces_ref[prong.task_index]);
+            });
     }
 }
 
@@ -324,6 +400,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap_or_else(|e| panic!("Failed to start Fork-Union pool: {e}"));
             for _ in 0..iters {
                 iteration_fu_dynamic(&mut pool, &mut bodies, &mut forces);
+            }
+        }
+        "fork_union_iter_static" => {
+            let mut pool = fu::ThreadPool::try_spawn(threads)
+                .unwrap_or_else(|e| panic!("Failed to start Fork-Union pool: {e}"));
+            for _ in 0..iters {
+                iteration_fu_iter_static(&mut pool, &mut bodies, &mut forces);
+            }
+        }
+        "fork_union_iter_dynamic" => {
+            let mut pool = fu::ThreadPool::try_spawn(threads)
+                .unwrap_or_else(|e| panic!("Failed to start Fork-Union pool: {e}"));
+            for _ in 0..iters {
+                iteration_fu_iter_dynamic(&mut pool, &mut bodies, &mut forces);
             }
         }
         "rayon_static" => {
