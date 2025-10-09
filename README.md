@@ -87,55 +87,8 @@ pool.for_n_dynamic(100, |prong| {
 });
 ```
 
-#### Parallel Iterator API
 
-For Rayon-style ergonomics, use the parallel iterator API with the `prelude`:
 
-```rust
-use fork_union as fu;
-use fork_union::prelude::*;
-
-let mut pool = fu::spawn(4);
-let mut data: Vec<usize> = (0..1000).collect();
-
-// Static scheduling (default)
-(&data[..])
-    .into_par_iter()
-    .with_pool(&mut pool)
-    .for_each(|value| {
-        // Process each element
-        println!("Value: {}", value);
-    });
-
-// Dynamic work-stealing
-(&mut data[..])
-    .into_par_iter()
-    .with_schedule(&mut pool, DynamicScheduler)
-    .for_each(|value| {
-        *value *= 2;
-    });
-
-// Advanced: map, filter, zip
-(&data[..])
-    .into_par_iter()
-    .filter(|&x| x % 2 == 0)
-    .map(|x| x * x)
-    .with_pool(&mut pool)
-    .for_each(|value| {
-        // Process filtered & mapped values
-        println!("Squared even: {}", value);
-    });
-
-// Parallel reduction with thread-local scratch space
-let mut scratch = vec![0usize; pool.threads()];
-(&data[..])
-    .into_par_iter()
-    .with_pool(&mut pool)
-    .fold_with_scratch(&mut scratch, |acc, value, _prong| {
-        *acc += *value;
-    });
-let total: usize = scratch.iter().sum();
-```
 
 A more realistic example with named threads and error handling may look like this:
 
@@ -156,6 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 ```
 
 For advanced usage, refer to the [NUMA section below](#non-uniform-memory-access-numa).
+For convenience Rayon-style parallel iterators pull the `prelude` module and [check out related examples](#rayon-style-parallel-iterators).
 
 ### Intro in C++
 
@@ -419,6 +373,68 @@ No kernel calls.
 No futexes.
 Works in tight loops.
 
+### Rayon-style Parallel Iterators
+
+For Rayon-style ergonomics, use the parallel iterator API with the `prelude`.
+Unlike Rayon, Fork Union's parallel iterators don't depend on the global state and allow explicit control over the thread pool and scheduling strategy.
+For statically shaped workloads, the default static scheduling is more efficient: 
+
+```rust
+use fork_union as fu;
+use fork_union::prelude::*;
+
+let mut pool = fu::spawn(4);
+let mut data: Vec<usize> = (0..1000).collect();
+
+(&data[..])
+    .into_par_iter()
+    .with_pool(&mut pool)
+    .for_each(|value| {
+        println!("Value: {}", value);
+    });
+```
+
+For dynamic work-stealing, use `with_schedule` with `DynamicScheduler`:
+
+```rust
+(&mut data[..])
+    .into_par_iter()
+    .with_schedule(&mut pool, DynamicScheduler)
+    .for_each(|value| {
+        *value *= 2;
+    });
+```
+
+This easily composes with other iterator adaptors, like `map`, `filter`, and `zip`:
+
+```rust
+(&data[..])
+    .into_par_iter()
+    .filter(|&x| x % 2 == 0)
+    .map(|x| x * x)
+    .with_pool(&mut pool)
+    .for_each(|value| {
+        println!("Squared even: {}", value);
+    });
+```
+
+Moreover, each thread can maintain its own scratch space to avoid contention during reductions.
+Cache-line alignment via `CacheAligned` prevents false sharing:
+
+```rust
+// Cache-line aligned wrapper to prevent false sharing
+let mut scratch: Vec<CacheAligned<usize>> =
+    (0..pool.threads()).map(|_| CacheAligned(0)).collect();
+
+(&data[..])
+    .into_par_iter()
+    .with_pool(&mut pool)
+    .fold_with_scratch(scratch.as_mut_slice(), |acc, value, _prong| {
+        acc.0 += *value;
+    });
+let total: usize = scratch.iter().map(|a| a.0).sum();
+```
+
 ## Performance
 
 One of the most common parallel workloads is the N-body simulation ¹.
@@ -433,19 +449,20 @@ C++ benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
 | Machine        | OpenMP (D) | OpenMP (S) | Fork Union (D) | Fork Union (S) |
 | :------------- | ---------: | ---------: | -------------: | -------------: |
 | 16x Intel SPR  |      20.3s |      16.0s |          18.1s |          10.3s |
-| 12x Apple M2   |          ? |   1m:16.7s |     1m:30.3s ² |     1m:40.7s ² |
+| 12x Apple M2   | 1m:34.8s ² | 1m:25.9s ² |          31.5s |          20.3s |
 | 96x Graviton 4 |      32.2s |      20.8s |          39.8s |          26.0s |
 
 Rust benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
 
-| Machine        | Rayon (D) | Rayon (S) | Fork Union (D) | Fork Union (S) |
-| :------------- | --------: | --------: | -------------: | -------------: |
-| 16x Intel SPR  |     51.4s |     38.1s |          15.9s |           9.8s |
-| 12x Apple M2   |  3m:23.5s |   2m:0.6s |        4m:8.4s |       1m:20.8s |
-| 96x Graviton 4 |  2m:13.9s |  1m:35.6s |          18.9s |          10.1s |
+| Machine        |  Rayon (D) |  Rayon (S) | Fork Union (D) | Fork Union (S) |
+| :------------- | ---------: | ---------: | -------------: | -------------: |
+| 16x Intel SPR  |    🔄 51.4s |    🔄 38.1s |          15.9s |           9.8s |
+| 12x Apple M2   | 🔄 1m:47.8s | 🔄 1m:07.1s | 24.5s, 🔄 26.8s | 11.0s, 🔄 11.8s |
+| 96x Graviton 4 | 🔄 2m:13.9s | 🔄 1m:35.6s |          18.9s |          10.1s |
 
 > ¹ Another common workload is "Parallel Reductions" covered in a separate [repository](https://github.com/ashvardanian/ParallelReductionsBenchmark).
-> ² When a combination of performance and efficiency cores is used, dynamic stealing may be more efficient than static slicing.
+> ² When a combination of performance and efficiency cores is used, dynamic stealing may be more efficient than static slicing. It's also fair to say, that OpenMP is not optimized for AppleClang.
+> 🔄 Rotation emoji stands for iterators, the default way to use Rayon and the opt-in slower, but more convenient variant for Fork Union.
 
 You can rerun those benchmarks with the following commands:
 
