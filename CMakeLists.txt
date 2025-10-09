@@ -13,7 +13,7 @@ endif ()
 
 project(
     fork_union
-    VERSION 2.2.10
+    VERSION 2.3.0
     DESCRIPTION "Low-latency OpenMP-style NUMA-aware cross-platform fine-grained parallelism library"
     LANGUAGES CXX
 )
