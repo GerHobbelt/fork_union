@@ -24,6 +24,48 @@ use core::ptr::NonNull;
 use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// Default alignment for preventing false sharing between threads.
+///
+/// Set to 128 bytes to account for adjacent cache-line prefetching on modern CPUs.
+/// This matches the C++ `default_alignment_k` constant defined in `fork_union.hpp`.
+///
+/// On x86, most CPUs fetch 2 cache lines (128 bytes) at once with spatial prefetching enabled.
+/// This conservative padding prevents false sharing even with aggressive prefetch settings.
+pub const DEFAULT_ALIGNMENT: usize = 128;
+
+/// Cache-line aligned wrapper to prevent false sharing between threads.
+///
+/// When multiple threads access separate data that resides on the same cache line,
+/// modifications by one thread invalidate the cache line for all others, causing
+/// performance degradation known as "false sharing".
+///
+/// This wrapper ensures each wrapped value occupies its own cache line (128 bytes),
+/// eliminating false sharing at the cost of increased memory usage.
+///
+/// # Examples
+///
+/// ```rust
+/// use fork_union::{CacheAligned, ThreadPool};
+///
+/// let mut pool = ThreadPool::try_spawn(4).unwrap();
+/// let data: Vec<usize> = (0..1000).collect();
+///
+/// // Each thread gets its own cache-aligned accumulator
+/// let mut scratch: Vec<CacheAligned<usize>> =
+///     (0..pool.threads()).map(|_| CacheAligned(0)).collect();
+///
+/// // No false sharing during parallel reduction
+/// for value in &data {
+///     let tid = *value % pool.threads();
+///     scratch[tid].0 += value;
+/// }
+///
+/// let total: usize = scratch.iter().map(|a| a.0).sum();
+/// ```
+#[repr(align(128))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheAligned<T>(pub T);
+
 /// A generic spin mutex that uses CPU-specific pause instructions for efficient busy-waiting.
 ///
 /// This is a low-level synchronization primitive that spins on a busy loop rather than
