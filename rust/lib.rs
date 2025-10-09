@@ -3609,11 +3609,11 @@ where
     T: Send + Sync,
     F: Fn(&mut T, Prong) + Sync + Send,
 {
-    let base_ptr = data.as_mut_ptr() as usize;
+    let ptr = SyncMutPtr::new(data.as_mut_ptr());
     let n = data.len();
 
     let _operation = pool.for_n(n, move |prong| {
-        let item = unsafe { &mut *(base_ptr as *mut T).add(prong.task_index) };
+        let item = unsafe { &mut *ptr.get(prong.task_index) };
         function(item, prong);
     });
 }
@@ -3624,11 +3624,11 @@ where
     T: Send + Sync,
     F: Fn(&mut T, Prong) + Sync + Send,
 {
-    let base_ptr = data.as_mut_ptr() as usize;
+    let ptr = SyncMutPtr::new(data.as_mut_ptr());
     let n = data.len();
 
     let _operation = pool.for_n_dynamic(n, move |prong| {
-        let item = unsafe { &mut *(base_ptr as *mut T).add(prong.task_index) };
+        let item = unsafe { &mut *ptr.get(prong.task_index) };
         function(item, prong);
     });
 }
