@@ -11,25 +11,39 @@
  *  - `NBODY_THREADS` - number of threads to use for the simulation (default: number of hardware threads).
  *
  *  The backends include: `fork_union_static`, `fork_union_dynamic`, `openmp_static`, and `openmp_dynamic`.
- *  To compile and run:
+ *  To compile and run on all cores in Linux:
  *
  *  @code{.sh}
  *  cmake -B build_release -D CMAKE_BUILD_TYPE=Release
  *  cmake --build build_release --config Release
- *  NBODY_COUNT=128 NBODY_THREADS=$(nproc) build_release/scripts/fork_union_nbody
+ *  NBODY_COUNT=128 NBODY_THREADS=$(nproc) build_release/fork_union_nbody
  *  @endcode
  *
  *  The default profiling scheme is to 1M iterations for 128 particles on each backend:
  *
  *  @code{.sh}
  *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
- *      NBODY_BACKEND=openmp_static build_release/scripts/fork_union_nbody
+ *      NBODY_BACKEND=openmp_static build_release/fork_union_nbody
  *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
- *      NBODY_BACKEND=openmp_dynamic build_release/scripts/fork_union_nbody
+ *      NBODY_BACKEND=openmp_dynamic build_release/fork_union_nbody
  *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
- *      NBODY_BACKEND=fork_union_static build_release/scripts/fork_union_nbody
+ *      NBODY_BACKEND=fork_union_static build_release/fork_union_nbody
  *  time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
- *      NBODY_BACKEND=fork_union_dynamic build_release/scripts/fork_union_nbody
+ *      NBODY_BACKEND=fork_union_dynamic build_release/fork_union_nbody
+ *  @endcode
+ *
+ *  On macOS, you may need to install OpenMP support via Homebrew:
+ *
+ *  @code{.sh}
+ *  brew install llvm libomp
+ *  cmake -B build_release -D CMAKE_BUILD_TYPE=Release \
+ *    -D CMAKE_C_COMPILER=$(brew --prefix llvm)/bin/clang \
+ *    -D CMAKE_CXX_COMPILER=$(brew --prefix llvm)/bin/clang++ \
+ *    -D CMAKE_CXX_FLAGS="-I$(brew --prefix libomp)/include" \
+ *    -D CMAKE_EXE_LINKER_FLAGS="-L$(brew --prefix libomp)/lib"
+ *  cmake --build build_release --config Release
+ *  NBODY_COUNT=128 NBODY_THREADS=$(sysctl -n hw.logicalcpu) NBODY_ITERATIONS=1000000 \
+ *    NBODY_BACKEND=fork_union_static build_release/fork_union_nbody
  *  @endcode
  */
 #include <vector> // `std::vector`

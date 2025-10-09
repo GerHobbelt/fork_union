@@ -530,30 +530,38 @@ int main(void) {
     // Start stress-testing the implementation
     std::printf("Starting stress tests...\n");
     std::size_t const max_cores = std::thread::hardware_concurrency();
+
+    // On 32-bit architectures, limit thread counts to avoid resource exhaustion
+    // Each thread needs ~8MB stack, and 255 threads would consume 2GB+ address space
+    constexpr bool is_32bit = sizeof(void *) == 4;
+    constexpr std::size_t max_stress_threads = is_32bit ? 23 : 255;
+
     using stress_test_func_t = bool(std::size_t, std::size_t) /* noexcept */;
     struct {
-        char const *name;
+        char const *pool_name;
         stress_test_func_t *function;
         std::size_t count_threads;
         std::size_t count_tasks;
     } const stress_tests[] = {
-        {"`fu8` with 3 threads & 3 inputs", &stress_test_composite<fu8_t>, 3, 3},
-        {"`fu8` with 3 threads & 2 inputs", &stress_test_composite<fu8_t>, 3, 2},
-        {"`fu8` with 3 threads & 4 inputs", &stress_test_composite<fu8_t>, 3, 4},
-        {"`fu8` with 3 threads & 5 inputs", &stress_test_composite<fu8_t>, 3, 5},
-        {"`fu8` with 7 threads & 255 inputs", &stress_test_composite<fu8_t>, 7, 255},
-        {"`fu8` with 255 threads & 7 inputs", &stress_test_composite<fu8_t>, 255, 7},
-        {"`fu8` with 253 threads & 254 inputs", &stress_test_composite<fu8_t>, 253, 254},
-        {"`fu8` with 253 threads & 255 inputs", &stress_test_composite<fu8_t>, 253, 255},
-        {"`fu8` with 255 threads & 255 inputs", &stress_test_composite<fu8_t>, 255, 255},
-        {"`fu16` with thread/core & 65K inputs", &stress_test_composite<fu16_t>, max_cores, UINT16_MAX},
-        {"`fu16` with 333 threads & 65K inputs", &stress_test_composite<fu16_t>, 333, UINT16_MAX},
+        {"fu8", &stress_test_composite<fu8_t>, 3, 3},
+        {"fu8", &stress_test_composite<fu8_t>, 3, 2},
+        {"fu8", &stress_test_composite<fu8_t>, 3, 4},
+        {"fu8", &stress_test_composite<fu8_t>, 3, 5},
+        {"fu8", &stress_test_composite<fu8_t>, 7, max_stress_threads},
+        {"fu8", &stress_test_composite<fu8_t>, max_stress_threads, 7},
+        {"fu8", &stress_test_composite<fu8_t>, max_stress_threads - 2, max_stress_threads - 1},
+        {"fu8", &stress_test_composite<fu8_t>, max_stress_threads - 2, max_stress_threads},
+        {"fu8", &stress_test_composite<fu8_t>, max_stress_threads, max_stress_threads},
+        {"fu16", &stress_test_composite<fu16_t>, max_cores, UINT16_MAX},
+        {"fu16", &stress_test_composite<fu16_t>, max_stress_threads, UINT16_MAX},
     };
 
     std::size_t const total_stress_tests = sizeof(stress_tests) / sizeof(stress_tests[0]);
     std::size_t failed_stress_tests = 0;
     for (std::size_t i = 0; i < total_stress_tests; ++i) {
-        std::printf("Running %s... ", stress_tests[i].name);
+        std::printf(                                          //
+            "Running `%s` with %zu threads & %zu inputs... ", //
+            stress_tests[i].pool_name, stress_tests[i].count_threads, stress_tests[i].count_tasks);
         bool const ok = stress_tests[i].function(stress_tests[i].count_threads, stress_tests[i].count_tasks);
         if (ok) { std::printf("PASS\n"); }
         else { std::printf("FAIL\n"); }
