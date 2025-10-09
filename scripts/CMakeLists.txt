@@ -82,19 +82,25 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(fork_union_nbody PRIVATE -fopenmp -flto -ffast-math)
     target_link_options(fork_union_nbody PRIVATE -fopenmp)
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(STATUS "Enabling OpenMP for fork_union_nbody on Clang")
     find_program(BREW_EXECUTABLE brew)
     if (BREW_EXECUTABLE)
         execute_process(
-            COMMAND ${BREW_EXECUTABLE} --prefix libomp OUTPUT_VARIABLE LIBOMP_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE
+            COMMAND ${BREW_EXECUTABLE} --prefix libomp
+            OUTPUT_VARIABLE LIBOMP_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
         )
-        if (LIBOMP_PREFIX)
+        if (LIBOMP_PREFIX AND EXISTS "${LIBOMP_PREFIX}/include/omp.h")
+            message(STATUS "Enabling OpenMP for fork_union_nbody on Clang with Homebrew libomp")
             target_include_directories(fork_union_nbody PRIVATE ${LIBOMP_PREFIX}/include)
             target_link_directories(fork_union_nbody PRIVATE ${LIBOMP_PREFIX}/lib)
             target_compile_options(fork_union_nbody PRIVATE -Xclang -fopenmp)
             target_link_libraries(fork_union_nbody PRIVATE omp)
-            target_compile_definitions(fork_union_nbody PRIVATE _OPENMP=201511)
+        else ()
+            message(STATUS "Homebrew libomp not found - OpenMP disabled for fork_union_nbody")
         endif ()
+    else ()
+        message(STATUS "Homebrew not found - OpenMP disabled for fork_union_nbody")
     endif ()
 endif ()
 set_target_properties_for_fork_union_script(fork_union_nbody)
