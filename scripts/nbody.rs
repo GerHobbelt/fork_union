@@ -15,23 +15,31 @@
 //! ```
 //!
 //! The default profiling scheme is to 1M iterations for 128 particles on each backend.
-//! On Linux, use `$(nproc)` for thread count; on macOS, use `$(sysctl -n hw.logicalcpu)`:
+//! First build the release binary, then benchmark each backend separately:
 //!
 //! ```sh
+//! # Build once
+//! cargo build --example nbody --release
+//!
+//! # Linux benchmarks (use nproc for CPU count)
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=rayon_static cargo run --example nbody --release
+//!     NBODY_BACKEND=rayon_static target/release/examples/nbody
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=rayon_dynamic cargo run --example nbody --release
+//!     NBODY_BACKEND=rayon_dynamic target/release/examples/nbody
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=fork_union_static cargo run --example nbody --release
+//!     NBODY_BACKEND=fork_union_static target/release/examples/nbody
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=fork_union_dynamic cargo run --example nbody --release
+//!     NBODY_BACKEND=fork_union_dynamic target/release/examples/nbody
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=fork_union_iter_static cargo run --example nbody --release
+//!     NBODY_BACKEND=fork_union_iter_static target/release/examples/nbody
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=fork_union_iter_dynamic cargo run --example nbody --release
+//!     NBODY_BACKEND=fork_union_iter_dynamic target/release/examples/nbody
 //! time NBODY_COUNT=128 NBODY_THREADS=$(nproc) NBODY_ITERATIONS=1000000 \
-//!     NBODY_BACKEND=tokio cargo run --example nbody --release
+//!     NBODY_BACKEND=tokio target/release/examples/nbody
+//!
+//! # macOS benchmarks (use sysctl -n hw.logicalcpu for CPU count)
+//! time NBODY_COUNT=128 NBODY_THREADS=$(sysctl -n hw.logicalcpu) NBODY_ITERATIONS=1000000 \
+//!     NBODY_BACKEND=fork_union_iter_static target/release/examples/nbody
 //! ```
 use rand::{rng, Rng};
 use std::env;
