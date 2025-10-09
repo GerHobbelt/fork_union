@@ -11,7 +11,11 @@ function (set_target_properties_for_fork_union_script target_name)
     # In release mode, enable optimizations
     if (CMAKE_BUILD_TYPE STREQUAL "Release")
         message(STATUS "Enabling optimizations for ${target_name}")
-        target_compile_options(${target_name} PRIVATE -O2)
+        target_compile_options(
+            ${target_name}
+            PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -march=native -mtune=native>
+                    $<$<CXX_COMPILER_ID:MSVC>:/O2 /Ob3>
+        )
     endif ()
 
     # if we're not in Release mode
