@@ -11,7 +11,11 @@ function (set_target_properties_for_fork_union_script target_name)
     # In release mode, enable optimizations
     if (CMAKE_BUILD_TYPE STREQUAL "Release")
         message(STATUS "Enabling optimizations for ${target_name}")
-        target_compile_options(${target_name} PRIVATE -O2)
+        target_compile_options(
+            ${target_name}
+            PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3 -march=native -mtune=native>
+                    $<$<CXX_COMPILER_ID:MSVC>:/O2 /Ob3>
+        )
     endif ()
 
     # if we're not in Release mode
@@ -75,9 +79,22 @@ set_target_properties(
 )
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     message(STATUS "Enabling OpenMP for fork_union_nbody on GCC")
-    target_compile_options(fork_union_nbody PRIVATE -fopenmp)
+    target_compile_options(fork_union_nbody PRIVATE -fopenmp -flto -ffast-math)
     target_link_options(fork_union_nbody PRIVATE -fopenmp)
-    target_compile_options(fork_union_nbody PRIVATE -flto)
-    target_compile_options(fork_union_nbody PRIVATE -ffast-math)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(STATUS "Enabling OpenMP for fork_union_nbody on Clang")
+    find_program(BREW_EXECUTABLE brew)
+    if (BREW_EXECUTABLE)
+        execute_process(
+            COMMAND ${BREW_EXECUTABLE} --prefix libomp OUTPUT_VARIABLE LIBOMP_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if (LIBOMP_PREFIX)
+            target_include_directories(fork_union_nbody PRIVATE ${LIBOMP_PREFIX}/include)
+            target_link_directories(fork_union_nbody PRIVATE ${LIBOMP_PREFIX}/lib)
+            target_compile_options(fork_union_nbody PRIVATE -Xclang -fopenmp)
+            target_link_libraries(fork_union_nbody PRIVATE omp)
+            target_compile_definitions(fork_union_nbody PRIVATE _OPENMP=201511)
+        endif ()
+    endif ()
 endif ()
 set_target_properties_for_fork_union_script(fork_union_nbody)

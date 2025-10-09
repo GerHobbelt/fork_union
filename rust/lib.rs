@@ -19,9 +19,52 @@ use std::ffi::CStr;
 
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Default alignment for preventing false sharing between threads.
+///
+/// Set to 128 bytes to account for adjacent cache-line prefetching on modern CPUs.
+/// This matches the C++ `default_alignment_k` constant defined in `fork_union.hpp`.
+///
+/// On x86, most CPUs fetch 2 cache lines (128 bytes) at once with spatial prefetching enabled.
+/// This conservative padding prevents false sharing even with aggressive prefetch settings.
+pub const DEFAULT_ALIGNMENT: usize = 128;
+
+/// Cache-line aligned wrapper to prevent false sharing between threads.
+///
+/// When multiple threads access separate data that resides on the same cache line,
+/// modifications by one thread invalidate the cache line for all others, causing
+/// performance degradation known as "false sharing".
+///
+/// This wrapper ensures each wrapped value occupies its own cache line (128 bytes),
+/// eliminating false sharing at the cost of increased memory usage.
+///
+/// # Examples
+///
+/// ```rust
+/// use fork_union::{CacheAligned, ThreadPool};
+///
+/// let mut pool = ThreadPool::try_spawn(4).unwrap();
+/// let data: Vec<usize> = (0..1000).collect();
+///
+/// // Each thread gets its own cache-aligned accumulator
+/// let mut scratch: Vec<CacheAligned<usize>> =
+///     (0..pool.threads()).map(|_| CacheAligned(0)).collect();
+///
+/// // No false sharing during parallel reduction
+/// for value in &data {
+///     let tid = *value % pool.threads();
+///     scratch[tid].0 += value;
+/// }
+///
+/// let total: usize = scratch.iter().map(|a| a.0).sum();
+/// ```
+#[repr(align(128))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheAligned<T>(pub T);
 
 /// A generic spin mutex that uses CPU-specific pause instructions for efficient busy-waiting.
 ///
@@ -1522,6 +1565,18 @@ impl<T> PinnedVec<T> {
         }
     }
 
+    /// Returns a synchronization-friendly mutable pointer wrapper.
+    ///
+    /// The returned pointer can be shared between threads as long as each
+    /// thread accesses disjoint indices.
+    pub fn sync_ptr(&self) -> SyncMutPtr<T> {
+        let ptr = match &self.allocation {
+            Some(alloc) => alloc.as_ptr() as *mut T,
+            None => core::ptr::NonNull::dangling().as_ptr(),
+        };
+        SyncMutPtr::new(ptr)
+    }
+
     /// Returns a slice containing the entire vector.
     pub fn as_slice(&self) -> &[T] {
         unsafe { core::slice::from_raw_parts(self.as_ptr(), self.len) }
@@ -1540,6 +1595,19 @@ impl<T> PinnedVec<T> {
     /// Returns a mutable iterator over the vector.
     pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, T> {
         self.as_mut_slice().iter_mut()
+    }
+
+    /// Creates a read-only parallel slice view over the vector.
+    pub fn par_iter(&self) -> ParallelSlice<'_, T> {
+        ParallelSlice::new(self.as_slice())
+    }
+
+    /// Creates a mutable parallel slice view over the vector.
+    pub fn par_iter_mut(&mut self) -> ParallelSliceMut<'_, T>
+    where
+        T: Send,
+    {
+        ParallelSliceMut::new(self.as_mut_slice())
     }
 
     /// Inserts an element at position `index`, shifting all elements after it to the right.
@@ -2083,6 +2151,42 @@ impl<T> RoundRobinVec<T> {
         result
     }
 
+    /// Creates a parallel read-only iterator over all elements in round-robin order.
+    pub fn par_iter(&self) -> ParallelRoundRobin<'_, T>
+    where
+        T: Sync,
+    {
+        ParallelRoundRobin::new(self)
+    }
+
+    /// Creates a parallel mutable iterator over all elements in round-robin order.
+    pub fn par_iter_mut(&mut self) -> ParallelRoundRobinMut<'_, T>
+    where
+        T: Send,
+    {
+        ParallelRoundRobinMut::new(self)
+    }
+
+    /// Executes a closure in parallel on each element, preserving round-robin distribution.
+    pub fn par_for_each<S, F>(&self, pool: &mut ThreadPool, schedule: S, function: F)
+    where
+        T: Sync,
+        S: ParallelSchedule,
+        F: Fn(&T, Prong) + Sync,
+    {
+        self.par_iter().drive(pool, schedule, &function);
+    }
+
+    /// Executes a mutable closure in parallel on each element.
+    pub fn par_for_each_mut<S, F>(&mut self, pool: &mut ThreadPool, schedule: S, function: F)
+    where
+        T: Send,
+        S: ParallelSchedule,
+        F: Fn(&mut T, Prong) + Sync,
+    {
+        self.par_iter_mut().drive(pool, schedule, &function);
+    }
+
     /// Removes and returns the last element from the distributed vector.
     /// The element is popped from the NUMA node it was last pushed to, maintaining
     /// round-robin balance.
@@ -2476,7 +2580,7 @@ unsafe impl<T: Sync> Sync for RoundRobinVec<T> {}
 /// let value = unsafe { sync_ptr.get(0) };
 /// assert_eq!(*value, 1);
 /// ```
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct SyncConstPtr<T> {
     ptr: *const T,
 }
@@ -2522,6 +2626,797 @@ impl<T> SyncConstPtr<T> {
 
 unsafe impl<T> Send for SyncConstPtr<T> {}
 unsafe impl<T> Sync for SyncConstPtr<T> {}
+
+#[derive(Clone, Copy)]
+pub struct SyncMutPtr<T> {
+    ptr: *mut T,
+    _marker: PhantomData<T>,
+}
+
+impl<T> SyncMutPtr<T> {
+    pub const fn new(ptr: *mut T) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns a mutable pointer to the element at the given index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - The index is within the bounds of the original allocation
+    /// - No overlapping mutable access occurs from multiple threads
+    /// - Each thread accesses disjoint indices when used concurrently
+    /// - The pointer remains valid for the duration of access
+    pub unsafe fn get(&self, index: usize) -> *mut T {
+        self.ptr.add(index)
+    }
+
+    pub fn as_ptr(&self) -> *mut T {
+        self.ptr
+    }
+}
+
+unsafe impl<T> Send for SyncMutPtr<T> {}
+unsafe impl<T> Sync for SyncMutPtr<T> {}
+
+/// Scheduler that uses static chunk assignment.
+#[derive(Clone, Copy, Debug)]
+pub struct StaticScheduler;
+
+/// Scheduler that enables dynamic work stealing.
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicScheduler;
+
+pub trait ParallelSchedule: Copy {
+    fn dispatch<F>(&self, pool: &mut ThreadPool, tasks: usize, function: F)
+    where
+        F: Fn(Prong) + Sync;
+
+    fn dispatch_slices<F>(&self, pool: &mut ThreadPool, tasks: usize, function: F)
+    where
+        F: Fn(Prong, usize) + Sync,
+    {
+        self.dispatch(pool, tasks, move |prong| {
+            function(prong, 1);
+        });
+    }
+}
+
+impl ParallelSchedule for StaticScheduler {
+    fn dispatch<F>(&self, pool: &mut ThreadPool, tasks: usize, function: F)
+    where
+        F: Fn(Prong) + Sync,
+    {
+        if tasks == 0 {
+            return;
+        }
+
+        let function_ptr = SyncConstPtr::new(&function as *const F);
+        let _operation = pool.for_n(tasks, move |prong| {
+            let func = unsafe { &*function_ptr.as_ptr() };
+            func(prong);
+        });
+    }
+
+    fn dispatch_slices<F>(&self, pool: &mut ThreadPool, tasks: usize, function: F)
+    where
+        F: Fn(Prong, usize) + Sync,
+    {
+        if tasks == 0 {
+            return;
+        }
+
+        let function_ptr = SyncConstPtr::new(&function as *const F);
+        let _operation = pool.for_slices(tasks, move |prong, count| {
+            let func = unsafe { &*function_ptr.as_ptr() };
+            func(prong, count);
+        });
+    }
+}
+
+impl ParallelSchedule for DynamicScheduler {
+    fn dispatch<F>(&self, pool: &mut ThreadPool, tasks: usize, function: F)
+    where
+        F: Fn(Prong) + Sync,
+    {
+        if tasks == 0 {
+            return;
+        }
+
+        let function_ptr = SyncConstPtr::new(&function as *const F);
+        let _operation = pool.for_n_dynamic(tasks, move |prong| {
+            let func = unsafe { &*function_ptr.as_ptr() };
+            func(prong);
+        });
+    }
+}
+
+pub trait ParallelIterator: Sized {
+    type Item;
+
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync;
+
+    fn drive_static<F>(self, pool: &mut ThreadPool, consumer: F)
+    where
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        self.drive(pool, StaticScheduler, &consumer);
+    }
+
+    fn drive_dynamic<F>(self, pool: &mut ThreadPool, consumer: F)
+    where
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        self.drive(pool, DynamicScheduler, &consumer);
+    }
+
+    fn map<M, U>(self, mapper: M) -> Map<Self, M>
+    where
+        M: Fn(Self::Item) -> U + Sync,
+    {
+        Map { base: self, mapper }
+    }
+
+    fn filter<P>(self, predicate: P) -> Filter<Self, P>
+    where
+        P: Fn(&Self::Item) -> bool + Sync,
+    {
+        Filter {
+            base: self,
+            predicate,
+        }
+    }
+}
+
+pub trait ParallelIteratorExt: ParallelIterator + Sized {
+    fn with_pool<'pool>(
+        self,
+        pool: &'pool mut ThreadPool,
+    ) -> ParallelRunner<'pool, Self, StaticScheduler> {
+        ParallelRunner {
+            pool,
+            iterator: self,
+            schedule: StaticScheduler,
+        }
+    }
+
+    fn with_schedule<'pool, S>(
+        self,
+        pool: &'pool mut ThreadPool,
+        schedule: S,
+    ) -> ParallelRunner<'pool, Self, S>
+    where
+        S: ParallelSchedule,
+    {
+        ParallelRunner {
+            pool,
+            iterator: self,
+            schedule,
+        }
+    }
+}
+
+impl<I: ParallelIterator> ParallelIteratorExt for I {}
+
+pub struct ParallelRunner<'pool, I, S> {
+    pool: &'pool mut ThreadPool,
+    iterator: I,
+    schedule: S,
+}
+
+impl<'pool, I, S> ParallelRunner<'pool, I, S>
+where
+    I: ParallelIterator,
+    S: ParallelSchedule,
+{
+    pub fn for_each<F>(self, function: F)
+    where
+        F: Fn(I::Item) + Sync,
+    {
+        let ParallelRunner {
+            pool,
+            iterator,
+            schedule,
+        } = self;
+        let function_ptr = SyncConstPtr::new(&function as *const F);
+        iterator.drive(pool, schedule, &move |item, _| {
+            let func = unsafe { &*function_ptr.as_ptr() };
+            func(item);
+        });
+    }
+
+    pub fn for_each_with_prong<F>(self, function: F)
+    where
+        F: Fn(I::Item, Prong) + Sync,
+    {
+        let ParallelRunner {
+            pool,
+            iterator,
+            schedule,
+        } = self;
+        let function_ptr = SyncConstPtr::new(&function as *const F);
+        iterator.drive(pool, schedule, &move |item, prong| {
+            let func = unsafe { &*function_ptr.as_ptr() };
+            func(item, prong);
+        });
+    }
+
+    pub fn fold_with_scratch<T, F>(self, scratch: &mut [T], fold: F)
+    where
+        T: Send,
+        F: Fn(&mut T, I::Item, Prong) + Sync,
+    {
+        let ParallelRunner {
+            pool,
+            iterator,
+            schedule,
+        } = self;
+        fold_with_scratch(pool, iterator, schedule, scratch, fold);
+    }
+
+    pub fn with_schedule<S2>(self, schedule: S2) -> ParallelRunner<'pool, I, S2>
+    where
+        S2: ParallelSchedule,
+    {
+        let ParallelRunner { pool, iterator, .. } = self;
+        ParallelRunner {
+            pool,
+            iterator,
+            schedule,
+        }
+    }
+}
+
+pub trait IntoParallelIterator {
+    type Item;
+    type Iter: ParallelIterator<Item = Self::Item>;
+
+    fn into_par_iter(self) -> Self::Iter;
+}
+
+impl<'a, T> IntoParallelIterator for &'a [T]
+where
+    T: Sync,
+{
+    type Item = &'a T;
+    type Iter = ParallelSlice<'a, T>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        ParallelSlice::new(self)
+    }
+}
+
+impl<'a, T> IntoParallelIterator for &'a mut [T]
+where
+    T: Send,
+{
+    type Item = &'a mut T;
+    type Iter = ParallelSliceMut<'a, T>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        ParallelSliceMut::new(self)
+    }
+}
+
+impl IntoParallelIterator for core::ops::Range<usize> {
+    type Item = usize;
+    type Iter = ParallelRange;
+
+    fn into_par_iter(self) -> Self::Iter {
+        ParallelRange::new(self)
+    }
+}
+
+impl<'a, T> IntoParallelIterator for &'a RoundRobinVec<T>
+where
+    T: Sync,
+{
+    type Item = &'a T;
+    type Iter = ParallelRoundRobin<'a, T>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        ParallelRoundRobin::new(self)
+    }
+}
+
+impl<'a, T> IntoParallelIterator for &'a mut RoundRobinVec<T>
+where
+    T: Send,
+{
+    type Item = &'a mut T;
+    type Iter = ParallelRoundRobinMut<'a, T>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        ParallelRoundRobinMut::new(self)
+    }
+}
+
+pub struct Map<I, M> {
+    base: I,
+    mapper: M,
+}
+
+impl<I, M, U> ParallelIterator for Map<I, M>
+where
+    I: ParallelIterator,
+    M: Fn(I::Item) -> U + Sync,
+{
+    type Item = U;
+
+    fn len(&self) -> usize {
+        self.base.len()
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        let Map { base, mapper } = self;
+        let mapper_ptr = SyncConstPtr::new(&mapper as *const M);
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        let mapped = move |item: I::Item, prong: Prong| {
+            let mp = unsafe { &*mapper_ptr.as_ptr() };
+            let next = mp(item);
+            let consumer_ref = unsafe { &*consumer_ptr.as_ptr() };
+            consumer_ref(next, prong);
+        };
+
+        base.drive(pool, schedule, &mapped);
+    }
+}
+
+pub struct Filter<I, P> {
+    base: I,
+    predicate: P,
+}
+
+impl<I, P> ParallelIterator for Filter<I, P>
+where
+    I: ParallelIterator,
+    P: Fn(&I::Item) -> bool + Sync,
+{
+    type Item = I::Item;
+
+    fn len(&self) -> usize {
+        self.base.len()
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        let Filter { base, predicate } = self;
+        let predicate_ptr = SyncConstPtr::new(&predicate as *const P);
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        let filtered = move |item: I::Item, prong: Prong| {
+            let pred = unsafe { &*predicate_ptr.as_ptr() };
+            if pred(&item) {
+                let consumer_ref = unsafe { &*consumer_ptr.as_ptr() };
+                consumer_ref(item, prong);
+            }
+        };
+
+        base.drive(pool, schedule, &filtered);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ParallelSlice<'a, T> {
+    data: &'a [T],
+}
+
+impl<'a, T> ParallelSlice<'a, T> {
+    pub fn new(data: &'a [T]) -> Self {
+        Self { data }
+    }
+
+    pub fn for_each_static<F>(self, pool: &mut ThreadPool, function: F)
+    where
+        T: Sync,
+        F: Fn(&'a T, Prong) + Sync,
+    {
+        self.drive_static(pool, function);
+    }
+
+    pub fn for_each_dynamic<F>(self, pool: &mut ThreadPool, function: F)
+    where
+        T: Sync,
+        F: Fn(&'a T, Prong) + Sync,
+    {
+        self.drive_dynamic(pool, function);
+    }
+
+    pub fn zip<'b, U>(self, other: ParallelSlice<'b, U>) -> ParallelSliceZip<'a, 'b, T, U> {
+        ParallelSliceZip {
+            left: self,
+            right: other,
+        }
+    }
+}
+
+impl<'a, T> ParallelIterator for ParallelSlice<'a, T>
+where
+    T: Sync,
+{
+    type Item = &'a T;
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        if self.data.is_empty() {
+            return;
+        }
+
+        let slice = self.data;
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        schedule.dispatch(pool, slice.len(), move |prong| {
+            let item = unsafe { slice.get_unchecked(prong.task_index) };
+            let func = unsafe { &*consumer_ptr.as_ptr() };
+            func(item, prong);
+        });
+    }
+}
+
+pub struct ParallelSliceZip<'a, 'b, T, U> {
+    left: ParallelSlice<'a, T>,
+    right: ParallelSlice<'b, U>,
+}
+
+impl<'a, 'b, T, U> ParallelIterator for ParallelSliceZip<'a, 'b, T, U>
+where
+    T: Sync,
+    U: Sync,
+{
+    type Item = (&'a T, &'b U);
+
+    fn len(&self) -> usize {
+        let len = self.left.data.len();
+        debug_assert_eq!(len, self.right.data.len());
+        len
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        let len = self.left.data.len();
+        assert_eq!(len, self.right.data.len(), "zip requires equal lengths");
+        if len == 0 {
+            return;
+        }
+
+        let left = self.left.data;
+        let right = self.right.data;
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        schedule.dispatch(pool, len, move |prong| {
+            let lhs = unsafe { left.get_unchecked(prong.task_index) };
+            let rhs = unsafe { right.get_unchecked(prong.task_index) };
+            let func = unsafe { &*consumer_ptr.as_ptr() };
+            func((lhs, rhs), prong);
+        });
+    }
+}
+
+pub struct ParallelSliceMut<'a, T> {
+    ptr: SyncMutPtr<T>,
+    len: usize,
+    _marker: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> ParallelSliceMut<'a, T> {
+    pub fn new(data: &'a mut [T]) -> Self {
+        Self {
+            ptr: SyncMutPtr::new(data.as_mut_ptr()),
+            len: data.len(),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn for_each_static<F>(self, pool: &mut ThreadPool, function: F)
+    where
+        T: Send,
+        F: Fn(&'a mut T, Prong) + Sync,
+    {
+        self.drive_static(pool, function);
+    }
+
+    pub fn for_each_dynamic<F>(self, pool: &mut ThreadPool, function: F)
+    where
+        T: Send,
+        F: Fn(&'a mut T, Prong) + Sync,
+    {
+        self.drive_dynamic(pool, function);
+    }
+}
+
+impl<'a, T> ParallelIterator for ParallelSliceMut<'a, T>
+where
+    T: Send,
+{
+    type Item = &'a mut T;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        if self.len == 0 {
+            return;
+        }
+
+        let ptr = self.ptr;
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        schedule.dispatch(pool, self.len, move |prong| {
+            let raw = unsafe { ptr.get(prong.task_index) };
+            let item = unsafe { &mut *raw };
+            let func = unsafe { &*consumer_ptr.as_ptr() };
+            func(item, prong);
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct ParallelRange {
+    range: core::ops::Range<usize>,
+}
+
+impl ParallelRange {
+    pub fn new(range: core::ops::Range<usize>) -> Self {
+        Self { range }
+    }
+}
+
+impl ParallelIterator for ParallelRange {
+    type Item = usize;
+
+    fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        let len = self.range.len();
+        if len == 0 {
+            return;
+        }
+
+        let start = self.range.start;
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        schedule.dispatch(pool, len, move |mut prong| {
+            let index = start + prong.task_index;
+            prong.task_index = index;
+            let func = unsafe { &*consumer_ptr.as_ptr() };
+            func(index, prong);
+        });
+    }
+}
+
+pub struct ParallelExactIter<T, I> {
+    len: usize,
+    indexer: I,
+    _marker: PhantomData<T>,
+}
+
+impl<T, I> ParallelExactIter<T, I>
+where
+    I: Fn(usize) -> T + Sync,
+{
+    pub fn new(len: usize, indexer: I) -> Self {
+        Self {
+            len,
+            indexer,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T, I> ParallelIterator for ParallelExactIter<T, I>
+where
+    T: Send,
+    I: Fn(usize) -> T + Sync,
+{
+    type Item = T;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        let ParallelExactIter { len, indexer, .. } = self;
+        if len == 0 {
+            return;
+        }
+
+        let indexer_ptr = SyncConstPtr::new(&indexer as *const I);
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        schedule.dispatch_slices(pool, len, move |mut prong, count| {
+            let mut current = prong.task_index;
+            let idx_fn = unsafe { &*indexer_ptr.as_ptr() };
+            let consumer_ref = unsafe { &*consumer_ptr.as_ptr() };
+            for _ in 0..count {
+                prong.task_index = current;
+                let value = idx_fn(current);
+                consumer_ref(value, prong);
+                current += 1;
+            }
+        });
+    }
+}
+
+pub struct ParallelRoundRobin<'a, T> {
+    colocations_ptr: SyncConstPtr<PinnedVec<T>>,
+    colocations_len: usize,
+    total_len: usize,
+    _marker: PhantomData<&'a [T]>,
+}
+
+impl<'a, T> ParallelRoundRobin<'a, T> {
+    fn new(vec: &'a RoundRobinVec<T>) -> Self {
+        let slice = vec.colocations.as_slice();
+        Self {
+            colocations_ptr: SyncConstPtr::new(slice.as_ptr()),
+            colocations_len: slice.len(),
+            total_len: vec.total_length,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> ParallelIterator for ParallelRoundRobin<'a, T>
+where
+    T: Sync,
+{
+    type Item = &'a T;
+
+    fn len(&self) -> usize {
+        self.total_len
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        if self.total_len == 0 || self.colocations_len == 0 {
+            return;
+        }
+
+        let colocations_ptr = self.colocations_ptr;
+        let colocations_len = self.colocations_len;
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        schedule.dispatch(pool, self.total_len, move |prong| {
+            let index = prong.task_index;
+            let colocation_index = index % colocations_len;
+            let local_index = index / colocations_len;
+            let base = colocations_ptr.as_ptr();
+            let colocation = unsafe { &*base.add(colocation_index) };
+            let slice = colocation.as_slice();
+            let item = unsafe { slice.get_unchecked(local_index) };
+            let func = unsafe { &*consumer_ptr.as_ptr() };
+            func(item, prong);
+        });
+    }
+}
+
+pub struct ParallelRoundRobinMut<'a, T> {
+    colocations_ptr: SyncConstPtr<PinnedVec<T>>,
+    colocations_len: usize,
+    total_len: usize,
+    _marker: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T> ParallelRoundRobinMut<'a, T> {
+    fn new(vec: &'a mut RoundRobinVec<T>) -> Self {
+        let slice = vec.colocations.as_slice();
+        Self {
+            colocations_ptr: SyncConstPtr::new(slice.as_ptr()),
+            colocations_len: slice.len(),
+            total_len: vec.total_length,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> ParallelIterator for ParallelRoundRobinMut<'a, T>
+where
+    T: Send,
+{
+    type Item = &'a mut T;
+
+    fn len(&self) -> usize {
+        self.total_len
+    }
+
+    fn drive<S, F>(self, pool: &mut ThreadPool, schedule: S, consumer: &F)
+    where
+        S: ParallelSchedule,
+        F: Fn(Self::Item, Prong) + Sync,
+    {
+        if self.total_len == 0 || self.colocations_len == 0 {
+            return;
+        }
+
+        let colocations_ptr = self.colocations_ptr;
+        let colocations_len = self.colocations_len;
+        let consumer_ptr = SyncConstPtr::new(consumer as *const F);
+        schedule.dispatch(pool, self.total_len, move |prong| {
+            let index = prong.task_index;
+            let colocation_index = index % colocations_len;
+            let local_index = index / colocations_len;
+            let base = colocations_ptr.as_ptr();
+            let colocation = unsafe { &*base.add(colocation_index) };
+            let base_ptr = colocation.sync_ptr();
+            let raw = unsafe { base_ptr.get(local_index) };
+            let item = unsafe { &mut *raw };
+            let func = unsafe { &*consumer_ptr.as_ptr() };
+            func(item, prong);
+        });
+    }
+}
+
+pub fn fold_with_scratch<I, S, T, F>(
+    pool: &mut ThreadPool,
+    iterator: I,
+    schedule: S,
+    scratch: &mut [T],
+    fold: F,
+) where
+    I: ParallelIterator,
+    S: ParallelSchedule,
+    T: Send,
+    F: Fn(&mut T, I::Item, Prong) + Sync,
+{
+    let scratch_len = scratch.len();
+    assert!(
+        scratch_len >= pool.threads(),
+        "scratch space must cover all threads"
+    );
+    let scratch_ptr = SyncMutPtr::new(scratch.as_mut_ptr());
+    iterator.drive(pool, schedule, &move |item, prong| {
+        debug_assert!(prong.thread_index < scratch_len);
+        let slot = unsafe { &mut *scratch_ptr.get(prong.thread_index) };
+        fold(slot, item, prong);
+    });
+}
+
+pub mod prelude {
+    pub use super::{
+        DynamicScheduler, IntoParallelIterator, ParallelIterator, ParallelIteratorExt,
+        ParallelRunner, StaticScheduler,
+    };
+}
 
 /// Operation object for parallel thread execution with explicit broadcast/join control.
 pub struct ForThreadsOperation<'a, F>
@@ -2756,11 +3651,11 @@ where
     T: Send + Sync,
     F: Fn(&mut T, Prong) + Sync + Send,
 {
-    let base_ptr = data.as_mut_ptr() as usize;
+    let ptr = SyncMutPtr::new(data.as_mut_ptr());
     let n = data.len();
 
     let _operation = pool.for_n(n, move |prong| {
-        let item = unsafe { &mut *(base_ptr as *mut T).add(prong.task_index) };
+        let item = unsafe { &mut *ptr.get(prong.task_index) };
         function(item, prong);
     });
 }
@@ -2771,11 +3666,11 @@ where
     T: Send + Sync,
     F: Fn(&mut T, Prong) + Sync + Send,
 {
-    let base_ptr = data.as_mut_ptr() as usize;
+    let ptr = SyncMutPtr::new(data.as_mut_ptr());
     let n = data.len();
 
     let _operation = pool.for_n_dynamic(n, move |prong| {
-        let item = unsafe { &mut *(base_ptr as *mut T).add(prong.task_index) };
+        let item = unsafe { &mut *ptr.get(prong.task_index) };
         function(item, prong);
     });
 }
@@ -2829,6 +3724,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+    use std::vec;
     use std::vec::Vec;
 
     #[inline]
@@ -3198,6 +4094,120 @@ mod tests {
         for (i, &value) in data.iter().enumerate() {
             assert_eq!(vec[i], value);
         }
+    }
+
+    #[test]
+    fn parallel_slice_static_for_each() {
+        let mut pool = spawn(hw_threads());
+        let data: Vec<usize> = (0..512).collect();
+        let total = AtomicUsize::new(0);
+
+        (&data[..])
+            .into_par_iter()
+            .with_pool(&mut pool)
+            .for_each(|value| {
+                total.fetch_add(*value, Ordering::Relaxed);
+            });
+
+        assert_eq!(total.load(Ordering::Relaxed), data.iter().sum());
+    }
+
+    #[test]
+    fn parallel_slice_mut_dynamic_for_each() {
+        let mut pool = spawn(hw_threads());
+        let mut data: Vec<usize> = (0..256).collect();
+
+        (&mut data[..])
+            .into_par_iter()
+            .with_schedule(&mut pool, DynamicScheduler)
+            .for_each(|value| {
+                *value *= 2;
+            });
+
+        for (i, v) in data.iter().enumerate() {
+            assert_eq!(*v, i * 2);
+        }
+    }
+
+    #[test]
+    fn parallel_slice_zip_sum() {
+        let mut pool = spawn(hw_threads());
+        let a: Vec<usize> = (0..128).collect();
+        let b: Vec<usize> = (0..128).rev().collect();
+        let sums: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..hw_threads()).map(|_| AtomicUsize::new(0)).collect());
+        let shared = Arc::clone(&sums);
+
+        (&a[..])
+            .into_par_iter()
+            .zip((&b[..]).into_par_iter())
+            .with_pool(&mut pool)
+            .for_each_with_prong(|(lhs, rhs), prong| {
+                shared[prong.thread_index % shared.len()].fetch_add(lhs + rhs, Ordering::Relaxed);
+            });
+
+        let total: usize = sums.iter().map(|v| v.load(Ordering::Relaxed)).sum();
+        let expected: usize = a.iter().zip(b.iter()).map(|(x, y)| x + y).sum();
+        assert_eq!(total, expected);
+    }
+
+    #[test]
+    fn parallel_exact_iter_dispatch() {
+        let mut pool = spawn(hw_threads());
+        let mut values = vec![0usize; 256];
+        let ptr = SyncMutPtr::new(values.as_mut_ptr());
+        (0..values.len())
+            .into_par_iter()
+            .with_pool(&mut pool)
+            .for_each_with_prong(|index, prong| {
+                let slot = unsafe { &mut *ptr.get(prong.task_index) };
+                *slot = index * index;
+            });
+
+        for (idx, val) in values.iter().enumerate() {
+            assert_eq!(*val, idx * idx);
+        }
+    }
+
+    #[test]
+    fn round_robin_parallel_mut() {
+        let mut pool = spawn(hw_threads());
+        let mut rr_vec =
+            RoundRobinVec::<usize>::with_capacity_per_colocation(8).expect("round robin vec");
+
+        // Populate evenly
+        for value in 0..32 {
+            rr_vec.push(value).expect("push");
+        }
+
+        rr_vec
+            .par_iter_mut()
+            .with_pool(&mut pool)
+            .for_each(|value| {
+                *value += 1;
+            });
+
+        for index in 0..rr_vec.len() {
+            assert_eq!(rr_vec.get(index), Some(&(index + 1)));
+        }
+    }
+
+    #[test]
+    fn scratch_reduction_collects_sum() {
+        let mut pool = spawn(hw_threads());
+        let data: Vec<usize> = (0..1024).collect();
+        let mut scratch = vec![0usize; pool.threads()];
+
+        (&data[..])
+            .into_par_iter()
+            .with_pool(&mut pool)
+            .fold_with_scratch(scratch.as_mut_slice(), |slot, value, _| {
+                *slot += *value;
+            });
+
+        let total: usize = scratch.iter().sum();
+        let expected: usize = data.iter().sum();
+        assert_eq!(total, expected);
     }
 
     #[test]
