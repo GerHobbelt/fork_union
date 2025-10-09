@@ -445,7 +445,7 @@ C++ benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
 
 | Machine        | OpenMP (D) | OpenMP (S) | Fork Union (D) | Fork Union (S) |
 | :------------- | ---------: | ---------: | -------------: | -------------: |
-| 16x Intel SPR  |      20.3s |      16.0s |          18.1s |          10.3s |
+| 16x Intel SPR  |      18.9s |      12.4s |          16.8s |           8.7s |
 | 12x Apple M2   | 1m:34.8s ² | 1m:25.9s ² |          31.5s |          20.3s |
 | 96x Graviton 4 |      32.2s |      20.8s |          39.8s |          26.0s |
 
@@ -453,7 +453,7 @@ Rust benchmarking results for $N=128$ bodies and $I=1e6$ iterations:
 
 | Machine        |  Rayon (D) |  Rayon (S) | Fork Union (D) | Fork Union (S) |
 | :------------- | ---------: | ---------: | -------------: | -------------: |
-| 16x Intel SPR  |    🔄 51.4s |    🔄 38.1s |          15.9s |           9.8s |
+| 16x Intel SPR  |    🔄 45.4s |    🔄 32.1s | 18.1s, 🔄 22.4s | 12.4s, 🔄 12.9s |
 | 12x Apple M2   | 🔄 1m:47.8s | 🔄 1m:07.1s | 24.5s, 🔄 26.8s | 11.0s, 🔄 11.8s |
 | 96x Graviton 4 | 🔄 2m:13.9s | 🔄 1m:35.6s |          18.9s |          10.1s |
 
@@ -469,6 +469,8 @@ cmake --build build_release --config Release
 time NBODY_COUNT=128 NBODY_ITERATIONS=1000000 NBODY_BACKEND=fork_union_static build_release/fork_union_nbody
 time NBODY_COUNT=128 NBODY_ITERATIONS=1000000 NBODY_BACKEND=fork_union_dynamic build_release/fork_union_nbody
 ```
+
+> Consult the header of `scripts/nbody.cpp` and `scripts/nbody.rs` for additional benchmarking options.
 
 ## Safety & Logic
 
